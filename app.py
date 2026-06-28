@@ -11,7 +11,7 @@ from src.reporting import build_report
 from src.storage import DEFAULT_TABLE_NAME, StorageUnavailable, fetch_reports, insert_report, is_configured
 
 
-APP_VERSION = "R1.0.1"
+APP_VERSION = "R1.0.2"
 
 
 st.set_page_config(

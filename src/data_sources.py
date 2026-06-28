@@ -141,6 +141,15 @@ def lookup_us_stock(ticker: str) -> StockLookupResult:
         result.sources.append(
             SourceRecord("SEC ticker mapping", "https://www.sec.gov/files/company_tickers.json")
         )
+        submission = _fetch_sec_submission(cik_info["cik_str"])
+        if submission:
+            result.sources.append(
+                SourceRecord(
+                    "SEC company submission",
+                    f"https://data.sec.gov/submissions/CIK{int(cik_info['cik_str']):010d}.json",
+                )
+            )
+            result.metrics.update(_parse_sec_company_profile(submission))
         facts = _fetch_sec_companyfacts(cik_info["cik_str"])
         if facts:
             result.sources.append(
@@ -155,6 +164,12 @@ def lookup_us_stock(ticker: str) -> StockLookupResult:
             result.warnings.append("SEC companyfacts 查無可用財報資料。")
     else:
         result.warnings.append("SEC ticker mapping 查無此 ticker，可能是非美國申報公司或代號輸入錯誤。")
+
+    profile = _fetch_yfinance_profile(ticker)
+    if profile:
+        result.sources.append(SourceRecord("Yahoo Finance profile", f"yfinance:{ticker}"))
+        result.metrics.update(profile)
+        result.company_name = result.company_name or profile.get("company_name")
 
     quote = _fetch_yahoo_chart_quote(ticker)
     if quote:
@@ -196,6 +211,7 @@ def _build_twse_result(query: str, company: dict[str, Any]) -> StockLookupResult
     result.sources.append(SourceRecord("上市公司每月營業收入", f"{TWSE_BASE}/opendata/t187ap05_L"))
     if revenue:
         result.metrics.update(_parse_tw_revenue(revenue))
+        result.metrics["industry"] = revenue.get("產業別") or result.metrics.get("industry")
     else:
         result.warnings.append("查不到最新月營收。")
 
@@ -258,6 +274,7 @@ def _build_tpex_result(query: str, company: dict[str, Any]) -> StockLookupResult
     result.sources.append(SourceRecord("上櫃公司每月營業收入", f"{TPEX_BASE}/mopsfin_t187ap05_O"))
     if revenue:
         result.metrics.update(_parse_tw_revenue(revenue))
+        result.metrics["industry"] = revenue.get("產業別") or result.metrics.get("industry")
     else:
         result.warnings.append("查不到最新月營收。")
 
@@ -545,7 +562,73 @@ def _parse_sec_metrics(facts: dict[str, Any]) -> dict[str, Any]:
                 "ttm_eps": _sum_last_values(eps_points, 4),
             }
         )
+
+    latest_revenue_value = _to_float((revenue_points[-1] if revenue_points else {}).get("val"))
+    gross_profit = _latest_quarter_value(us_gaap, ("GrossProfit",))
+    operating_income = _latest_quarter_value(us_gaap, ("OperatingIncomeLoss",))
+    net_income = _latest_quarter_value(us_gaap, ("NetIncomeLoss",))
+    r_and_d = _latest_quarter_value(us_gaap, ("ResearchAndDevelopmentExpense",))
+
+    if latest_revenue_value:
+        metrics.update(
+            {
+                "gross_margin_pct": _safe_pct(gross_profit, latest_revenue_value),
+                "operating_margin_pct": _safe_pct(operating_income, latest_revenue_value),
+                "net_margin_pct": _safe_pct(net_income, latest_revenue_value),
+                "research_development_ratio_pct": _safe_pct(r_and_d, latest_revenue_value),
+            }
+        )
     return metrics
+
+
+def _fetch_sec_submission(cik: int | str) -> dict[str, Any] | None:
+    url = f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json"
+    try:
+        return _get_json(url, ttl_seconds=3600)
+    except Exception:
+        return None
+
+
+def _parse_sec_company_profile(submission: dict[str, Any]) -> dict[str, Any]:
+    exchanges = submission.get("exchanges") or []
+    tickers = submission.get("tickers") or []
+    return {
+        "sec_company_name": submission.get("name"),
+        "sec_sic": submission.get("sic"),
+        "sec_sic_description": submission.get("sicDescription"),
+        "filer_category": submission.get("category"),
+        "entity_type": submission.get("entityType"),
+        "exchange": exchanges[0] if exchanges else None,
+        "sec_ticker": tickers[0] if tickers else None,
+    }
+
+
+def _fetch_yfinance_profile(ticker: str) -> dict[str, Any] | None:
+    try:
+        import yfinance as yf
+
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        return None
+    if not info:
+        return None
+    return {
+        "company_name": info.get("longName") or info.get("shortName"),
+        "sector": info.get("sector"),
+        "industry": info.get("industry"),
+        "business_summary": _compact_text(info.get("longBusinessSummary") or "", 900),
+        "website": info.get("website"),
+        "market_cap": _to_float(info.get("marketCap")),
+        "enterprise_value": _to_float(info.get("enterpriseValue")),
+        "trailing_pe": _to_float(info.get("trailingPE")),
+        "forward_pe": _to_float(info.get("forwardPE")),
+        "price_to_sales_ttm": _to_float(info.get("priceToSalesTrailing12Months")),
+        "yahoo_gross_margin_pct": _ratio_to_pct(info.get("grossMargins")),
+        "yahoo_operating_margin_pct": _ratio_to_pct(info.get("operatingMargins")),
+        "revenue_growth_pct": _ratio_to_pct(info.get("revenueGrowth")),
+        "earnings_growth_pct": _ratio_to_pct(info.get("earningsGrowth")),
+        "free_cashflow": _to_float(info.get("freeCashflow")),
+    }
 
 
 def _latest_quarter_points(
@@ -577,6 +660,13 @@ def _latest_quarter_points(
                 best_points = points
                 best_end = str(points[-1].get("end") or "")
     return best_points
+
+
+def _latest_quarter_value(us_gaap: dict[str, Any], tags: tuple[str, ...]) -> float | None:
+    points = _latest_quarter_points(us_gaap, tags, preferred_units=("USD",))
+    if not points:
+        return None
+    return _to_float(points[-1].get("val"))
 
 
 def _same_quarter_previous_year(points: list[dict[str, Any]], latest: dict[str, Any]) -> dict[str, Any] | None:
@@ -641,7 +731,7 @@ def _fetch_yahoo_rss_news(ticker: str) -> list[dict[str, Any]]:
 
 def _finalize_valuation_metrics(result: StockLookupResult) -> None:
     latest_close = _to_float(result.metrics.get("latest_close"))
-    official_pe = _to_float(result.metrics.get("official_pe"))
+    official_pe = _first_float(result.metrics, "official_pe", "trailing_pe")
     ttm_eps = _to_float(result.metrics.get("ttm_eps"))
 
     if ttm_eps is None and latest_close and official_pe and official_pe > 0:
@@ -651,10 +741,14 @@ def _finalize_valuation_metrics(result: StockLookupResult) -> None:
 
     if official_pe:
         result.metrics["effective_pe"] = official_pe
-        result.metrics["effective_pe_method"] = "官方揭露本益比"
+        result.metrics["effective_pe_method"] = "官方/資料源揭露本益比"
     elif latest_close and ttm_eps and ttm_eps > 0:
         result.metrics["effective_pe"] = latest_close / ttm_eps
         result.metrics["effective_pe_method"] = "最新收盤價 / TTM EPS"
+    elif ttm_eps is not None and ttm_eps <= 0:
+        result.metrics["effective_pe"] = None
+        result.metrics["effective_pe_method"] = "TTM EPS 為負，本益比不適用"
+        result.warnings.append("TTM EPS 為負，本益比不適用；應改看營收成長、毛利率、營益率與現金流。")
     else:
         result.metrics["effective_pe"] = None
         result.warnings.append("缺少正數 TTM EPS 或收盤價，無法推算實質本益比。")
@@ -671,6 +765,7 @@ def _add_risk_flags(result: StockLookupResult) -> None:
     pe = _to_float(metrics.get("effective_pe"))
     gross_margin = _to_float(metrics.get("gross_margin_pct"))
     operating_margin = _to_float(metrics.get("operating_margin_pct"))
+    price_to_sales = _to_float(metrics.get("price_to_sales_ttm"))
 
     if revenue_yoy is None:
         flags.append("營收年增率不清楚")
@@ -697,6 +792,8 @@ def _add_risk_flags(result: StockLookupResult) -> None:
         flags.append("毛利率偏薄")
     if operating_margin is not None and operating_margin < 5:
         flags.append("營益率偏薄")
+    if price_to_sales is not None and price_to_sales > 15:
+        flags.append("PS 估值偏高")
 
     metrics["risk_flags"] = flags
 
@@ -725,6 +822,13 @@ def _to_float(value: Any) -> float | None:
     if math.isnan(number) or math.isinf(number):
         return None
     return number
+
+
+def _ratio_to_pct(value: Any) -> float | None:
+    number = _to_float(value)
+    if number is None:
+        return None
+    return number * 100
 
 
 def _first_float(data: dict[str, Any], *keys: str) -> float | None:
