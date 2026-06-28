@@ -11,7 +11,7 @@ from src.reporting import build_report
 from src.storage import DEFAULT_TABLE_NAME, StorageUnavailable, fetch_reports, insert_report, is_configured
 
 
-APP_VERSION = "R1.0.4"
+APP_VERSION = "R1.0.5"
 
 
 st.set_page_config(
@@ -330,21 +330,73 @@ def _inject_style() -> None:
     st.markdown(
         """
         <style>
+        :root {
+            color-scheme: dark;
+        }
         .stApp {
-            background: #f5f6f8;
-            color: #1d1d1f;
+            background: #0f1117;
+            color: #e7eaf0;
         }
         h1, h2, h3 {
             letter-spacing: 0;
+            color: #f4f7fb;
+        }
+        p, li, label, span {
+            color: #d8dde7;
         }
         div[data-testid="stForm"] {
-            border: 1px solid #d9dde3;
+            border: 1px solid #2b3140;
             border-radius: 8px;
             padding: 1rem;
-            background: #ffffff;
+            background: #151923;
         }
         div[data-testid="stExpander"] {
+            background: #151923;
+            border: 1px solid #2b3140;
             border-radius: 8px;
+        }
+        div[data-testid="stVerticalBlockBorderWrapper"] {
+            border-color: #2b3140;
+            background: #151923;
+        }
+        div[data-testid="stStatusWidget"] {
+            background: #151923;
+            border: 1px solid #2b3140;
+            border-radius: 8px;
+        }
+        div[data-testid="stAlert"] {
+            border-radius: 8px;
+        }
+        input, textarea {
+            background: #1c2230 !important;
+            color: #f4f7fb !important;
+            border-color: #384256 !important;
+        }
+        input::placeholder, textarea::placeholder {
+            color: #8f98aa !important;
+        }
+        button[kind="primary"], div[data-testid="stFormSubmitButton"] button {
+            background: #ef4444;
+            color: #ffffff;
+            border: 0;
+            border-radius: 8px;
+        }
+        button[kind="primary"]:hover, div[data-testid="stFormSubmitButton"] button:hover {
+            background: #dc2626;
+            color: #ffffff;
+            border: 0;
+        }
+        code, pre {
+            background: #0b0d12 !important;
+            color: #d7f5dd !important;
+            border: 1px solid #2b3140;
+            border-radius: 8px;
+        }
+        a {
+            color: #93c5fd;
+        }
+        hr {
+            border-color: #2b3140;
         }
         </style>
         """,

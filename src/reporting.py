@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .data_sources import StockLookupResult, to_pretty_json
@@ -136,7 +137,9 @@ def build_rule_based_report(result: StockLookupResult) -> str:
         "## 1. 產業定位與核心業務",
         f"- 產業：{_industry_line(metrics)}",
         f"- 公司名稱：{_fmt(metrics.get('full_company_name') or result.company_name)}",
-        f"- 核心業務：{_business_line(metrics)}",
+        f"- 它賣什麼：{_business_line(metrics)}",
+        f"- 錢怎麼賺：{_revenue_model(metrics)}",
+        f"- 客戶為何需要它：{_customer_problem(metrics)}",
         f"- 市場地位：{_market_position(metrics, result)}",
         f"- 產業鏈位置：{_industry_position(metrics)}",
         f"- 護城河判斷：{_moat_comment(metrics)}",
@@ -180,6 +183,7 @@ def build_rule_based_report(result: StockLookupResult) -> str:
             "",
             "## 5. 是否與 AI 產業有關",
             f"- AI 關聯：{_ai_comment(result)}",
+            f"- AI 敘事證據：{_ai_evidence(result)}",
             f"- AI 分類：{_ai_classification(result)}",
             "- 防禦結論：若無法從營收、EPS、毛利率或客戶需求資料證明 AI 帶來實質獲利，先視為題材，不視為基本面。",
         ]
@@ -288,8 +292,9 @@ def _ai_comment(result: StockLookupResult) -> str:
             " ".join(str(item.get("summary", "")) for item in result.news),
         ]
     ).lower()
-    if "ai" in blob or "人工智慧" in blob or "伺服器" in blob or "gpu" in blob:
-        return "有 AI 相關敘事，但仍需看營收與 EPS 是否真正受惠。"
+    evidence = _ai_evidence_items(result)
+    if evidence:
+        return f"有 {len(evidence)} 個 AI 相關線索；但這只是敘事來源，仍需看營收與 EPS 是否真正受惠。"
     return "目前資料看不出直接 AI 關聯。"
 
 
@@ -311,6 +316,56 @@ def _ai_classification(result: StockLookupResult) -> str:
     if "ai" in blob:
         return "有 AI 敘事，但目前資料不足以證明是核心 AI。"
     return "非明確 AI 標的。"
+
+
+def _ai_evidence(result: StockLookupResult) -> str:
+    items = _ai_evidence_items(result)
+    if not items:
+        return "查無具體 AI 敘事證據。"
+    return "；".join(items[:3])
+
+
+def _ai_evidence_items(result: StockLookupResult) -> list[str]:
+    evidence = []
+    business = str(result.metrics.get("business_summary") or "")
+    if _contains_ai_term(business):
+        evidence.append(f"公司業務摘要：{_ai_business_reason(business)}")
+    for item in result.news:
+        text = f"{item.get('title', '')} {item.get('summary', '')}"
+        if _contains_ai_term(text):
+            title = item.get("title") or "未命名新聞"
+            evidence.append(f"新聞「{title}」：{_ai_news_reason(text)}")
+    return evidence
+
+
+def _contains_ai_term(text: str) -> bool:
+    lowered = text.lower()
+    return bool(
+        re.search(r"(^|[^a-z])ai([^a-z]|$)", lowered)
+        or any(term in lowered for term in ("artificial intelligence", "gpu", "hpc", "machine learning", "mlops", "data science", "llm", "算力", "人工智慧", "伺服器"))
+    )
+
+
+def _ai_business_reason(text: str) -> str:
+    lowered = text.lower()
+    if "jfrog ml" in lowered or "mlops" in lowered:
+        return "產品線含 JFrog ML / MLOps，服務資料科學團隊建置、訓練、部署與監控模型；這是 AI/ML 開發流程工具，不是算力核心。"
+    if "gpu" in lowered or "hpc" in lowered:
+        return "公司業務摘要出現 GPU/HPC 線索，可能靠近算力供應鏈。"
+    return _compact_sentence(text, 120)
+
+
+def _ai_news_reason(text: str) -> str:
+    lowered = text.lower()
+    if "cloud business" in lowered and "artificial intelligence" in lowered:
+        return "市場把雲端業務成長與 AI 供應鏈定位連在一起，但仍只是外部敘事，需看財報是否轉成 EPS。"
+    if "promising ai stocks" in lowered or "ai stocks" in lowered:
+        return "被市場文章/券商敘事歸類為 AI 股票，這不是營收證據，只是題材標籤。"
+    if "ai capex" in lowered:
+        return "新聞討論 AI 資本支出循環，需確認公司是否直接受惠。"
+    if "artificial intelligence" in lowered or re.search(r"(^|[^a-z])ai([^a-z]|$)", lowered):
+        return "新聞出現 AI 關鍵字，但未必代表公司有核心 AI 技術或直接獲利。"
+    return _compact_sentence(text, 100)
 
 
 def _industry_line(metrics: dict[str, Any]) -> str:
@@ -343,6 +398,37 @@ def _business_line(metrics: dict[str, Any]) -> str:
     if not summary:
         return _business_from_industry(metrics)
     return _translate_business_summary(summary)
+
+
+def _revenue_model(metrics: dict[str, Any]) -> str:
+    summary = str(metrics.get("business_summary") or "").lower()
+    industry = " ".join(
+        str(metrics.get(key) or "").lower()
+        for key in ("industry", "sector", "sec_sic_description", "full_company_name")
+    )
+    if "jfrog" in summary or ("software supply chain" in summary and "artifactory" in summary):
+        return "主要靠企業軟體平台訂閱、雲端用量、企業級安全/治理模組與大型客戶擴充使用量賺錢。"
+    if "software" in summary or "software" in industry:
+        return "通常靠訂閱授權、雲端用量、企業合約與增購模組賺錢；重點看續約率、淨留存率與銷售效率。"
+    if "台灣積體電路" in industry or "台積電" in industry:
+        return "靠晶圓代工產能、先進製程價格、客戶投片量與高階封裝需求賺錢。"
+    if "半導體" in industry:
+        return "靠半導體產品/製造/設備/材料出貨賺錢；重點看報價、稼動率與客戶拉貨。"
+    return "不清楚；目前資料不足以判斷收入模式。"
+
+
+def _customer_problem(metrics: dict[str, Any]) -> str:
+    summary = str(metrics.get("business_summary") or "").lower()
+    industry = " ".join(str(metrics.get(key) or "").lower() for key in ("industry", "sector", "sec_sic_description"))
+    if "jfrog" in summary or ("artifactory" in summary and "xray" in summary):
+        return "企業軟體團隊需要管理大量開源/內部套件、掃描漏洞、控管軟體供應鏈風險，並把程式碼穩定部署到正式環境。"
+    if "software" in summary or "software" in industry:
+        return "企業想降低流程成本、提高自動化與資料可見度；但同類 SaaS 競爭通常很擠。"
+    if "台積電" in str(metrics.get("full_company_name") or ""):
+        return "晶片設計公司需要高良率、高效能與大規模先進製程產能，自己蓋廠成本與難度太高。"
+    if "半導體" in industry:
+        return "下游客戶需要效能、成本、交期與良率；景氣反轉時砍單會很直接。"
+    return "不清楚；缺少客戶結構與使用場景資料。"
 
 
 def _revenue_yoy_text(result: StockLookupResult) -> str:
@@ -399,8 +485,8 @@ def _news_readthrough(item: dict[str, Any]) -> str:
         return "市場敘事偏估值/券商喊價，不能當基本面證據"
     if any(term in text for term in ("revenue", "earnings", "guidance", "outlook")):
         return "與營收/獲利展望相關，需核對實際財報"
-    if "ai" in text:
-        return "AI 敘事出現，需確認是否轉成營收與 EPS"
+    if _contains_ai_term(f" {text} "):
+        return "AI 敘事出現，但這只是敘事；要看是否轉成營收、毛利率與 EPS"
     return "偏市場情緒，參考價值有限"
 
 
@@ -480,12 +566,21 @@ def _business_from_industry(metrics: dict[str, Any]) -> str:
 def _translate_business_summary(summary: str) -> str:
     lower = summary.lower()
     if "software supply chain" in lower and "artifactory" in lower:
-        return "軟體供應鏈平台，核心產品包含套件儲存庫、開源套件治理、安全掃描與軟體發布流程管理。"
+        return "軟體供應鏈平台。產品包含 JFrog Artifactory 套件儲存庫、Curation 開源套件治理、Xray 安全掃描、Distribution/平台工具，用來管控軟體從開發、掃描到發布的流程。"
     if "semiconductor" in lower:
         return "半導體相關業務；需進一步看製造、設計、設備或材料位置。"
     if len(summary) <= 220:
         return summary
     return summary[:219].rstrip() + "…"
+
+
+def _compact_sentence(text: str, max_len: int) -> str:
+    text = " ".join(str(text or "").split())
+    if not text:
+        return "不清楚"
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
 
 
 def _fmt(value: Any) -> str:
