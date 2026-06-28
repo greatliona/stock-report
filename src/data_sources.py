@@ -545,11 +545,14 @@ def _parse_sec_metrics(facts: dict[str, Any]) -> dict[str, Any]:
     if revenue_points:
         latest_revenue = revenue_points[-1]
         comparable = _same_quarter_previous_year(revenue_points, latest_revenue)
+        revenue_yoy_series = _latest_yoy_series(revenue_points, count=4)
         metrics.update(
             {
                 "latest_revenue_period": latest_revenue.get("frame") or latest_revenue.get("end"),
                 "latest_quarter_revenue": _to_float(latest_revenue.get("val")),
                 "latest_quarter_revenue_yoy_pct": _growth_pct(latest_revenue, comparable),
+                "revenue_yoy_series": revenue_yoy_series,
+                "revenue_yoy_trend": _series_trend([item.get("yoy_pct") for item in revenue_yoy_series]),
                 "ttm_revenue": _sum_last_values(revenue_points, 4),
             }
         )
@@ -565,14 +568,22 @@ def _parse_sec_metrics(facts: dict[str, Any]) -> dict[str, Any]:
 
     latest_revenue_value = _to_float((revenue_points[-1] if revenue_points else {}).get("val"))
     gross_profit = _latest_quarter_value(us_gaap, ("GrossProfit",))
+    gross_profit_points = _latest_quarter_points(us_gaap, ("GrossProfit",), preferred_units=("USD",))
     operating_income = _latest_quarter_value(us_gaap, ("OperatingIncomeLoss",))
     net_income = _latest_quarter_value(us_gaap, ("NetIncomeLoss",))
     r_and_d = _latest_quarter_value(us_gaap, ("ResearchAndDevelopmentExpense",))
 
     if latest_revenue_value:
+        gross_margin = _safe_pct(gross_profit, latest_revenue_value)
+        previous_gross_margin = _previous_same_quarter_margin(revenue_points, gross_profit_points)
         metrics.update(
             {
-                "gross_margin_pct": _safe_pct(gross_profit, latest_revenue_value),
+                "gross_margin_pct": gross_margin,
+                "gross_margin_yoy_change_points": (
+                    gross_margin - previous_gross_margin
+                    if gross_margin is not None and previous_gross_margin is not None
+                    else None
+                ),
                 "operating_margin_pct": _safe_pct(operating_income, latest_revenue_value),
                 "net_margin_pct": _safe_pct(net_income, latest_revenue_value),
                 "research_development_ratio_pct": _safe_pct(r_and_d, latest_revenue_value),
@@ -628,6 +639,8 @@ def _fetch_yfinance_profile(ticker: str) -> dict[str, Any] | None:
         "revenue_growth_pct": _ratio_to_pct(info.get("revenueGrowth")),
         "earnings_growth_pct": _ratio_to_pct(info.get("earningsGrowth")),
         "free_cashflow": _to_float(info.get("freeCashflow")),
+        "fifty_two_week_high": _to_float(info.get("fiftyTwoWeekHigh")),
+        "fifty_two_week_low": _to_float(info.get("fiftyTwoWeekLow")),
     }
 
 
@@ -681,8 +694,55 @@ def _same_quarter_previous_year(points: list[dict[str, Any]], latest: dict[str, 
     return None
 
 
+def _latest_yoy_series(points: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+    series = []
+    for point in points:
+        previous = _same_quarter_previous_year(points, point)
+        yoy = _growth_pct(point, previous)
+        if yoy is None:
+            continue
+        series.append(
+            {
+                "period": point.get("frame") or point.get("end"),
+                "value": _to_float(point.get("val")),
+                "yoy_pct": yoy,
+            }
+        )
+    return series[-count:]
+
+
+def _series_trend(values: list[Any]) -> str | None:
+    clean = [_to_float(value) for value in values]
+    clean = [value for value in clean if value is not None]
+    if len(clean) < 3:
+        return None
+    if all(later > earlier for earlier, later in zip(clean, clean[1:])):
+        return "連續放大"
+    if all(later < earlier for earlier, later in zip(clean, clean[1:])):
+        return "連續降溫"
+    return "震盪"
+
+
+def _previous_same_quarter_margin(
+    revenue_points: list[dict[str, Any]],
+    gross_profit_points: list[dict[str, Any]],
+) -> float | None:
+    if not revenue_points or not gross_profit_points:
+        return None
+    latest_revenue = revenue_points[-1]
+    previous_revenue = _same_quarter_previous_year(revenue_points, latest_revenue)
+    if not previous_revenue:
+        return None
+    previous_gross = None
+    for point in gross_profit_points:
+        if point.get("frame") == previous_revenue.get("frame"):
+            previous_gross = point
+            break
+    return _safe_pct(_to_float((previous_gross or {}).get("val")), _to_float(previous_revenue.get("val")))
+
+
 def _fetch_yahoo_chart_quote(ticker: str) -> dict[str, Any] | None:
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1mo&interval=1d"
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
     try:
         data = _get_json(url, ttl_seconds=300)
     except Exception:
@@ -691,12 +751,26 @@ def _fetch_yahoo_chart_quote(ticker: str) -> dict[str, Any] | None:
     if not result:
         return None
     meta = result.get("meta", {})
+    closes = [
+        _to_float(value)
+        for value in ((result.get("indicators", {}).get("quote") or [{}])[0].get("close") or [])
+    ]
+    closes = [value for value in closes if value is not None]
+    latest_close = _to_float(meta.get("regularMarketPrice") or meta.get("chartPreviousClose"))
+    year_high = max(closes) if closes else None
     return {
-        "latest_close": _to_float(meta.get("regularMarketPrice") or meta.get("chartPreviousClose")),
+        "latest_close": latest_close,
         "price_date": datetime.now(timezone.utc).date().isoformat(),
         "currency": meta.get("currency"),
         "exchange": meta.get("exchangeName"),
         "company_name": meta.get("longName") or meta.get("shortName"),
+        "one_year_high": year_high,
+        "near_one_year_high": bool(latest_close and year_high and latest_close >= year_high * 0.95),
+        "drawdown_from_one_year_high_pct": (
+            (latest_close - year_high) / year_high * 100
+            if latest_close is not None and year_high
+            else None
+        ),
     }
 
 
@@ -794,6 +868,8 @@ def _add_risk_flags(result: StockLookupResult) -> None:
         flags.append("營益率偏薄")
     if price_to_sales is not None and price_to_sales > 15:
         flags.append("PS 估值偏高")
+    if metrics.get("near_one_year_high") and eps is not None and eps <= 0:
+        flags.append("股價接近一年高但 EPS 仍非正數，股價與獲利背離")
 
     metrics["risk_flags"] = flags
 

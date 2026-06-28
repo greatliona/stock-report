@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import streamlit as st
@@ -11,7 +11,7 @@ from src.reporting import build_report
 from src.storage import DEFAULT_TABLE_NAME, StorageUnavailable, fetch_reports, insert_report, is_configured
 
 
-APP_VERSION = "R1.0.2"
+APP_VERSION = "R1.0.4"
 
 
 st.set_page_config(
@@ -29,6 +29,7 @@ def main() -> None:
 
     config = _load_config()
     _show_storage_status(config)
+    _show_ai_guard_status(config)
 
     with st.form("lookup_form", clear_on_submit=False):
         user_input = st.text_input("輸入股號、股名或美股 ticker", placeholder="例如：2330、台積電、NVDA")
@@ -49,10 +50,22 @@ def _handle_lookup(user_input: str, config: dict[str, Any]) -> None:
         try:
             result = lookup_stock(user_input)
             st.write("資料查詢完成")
+            ai_decision = _ai_guard_decision(config)
+            if ai_decision["allowed"]:
+                st.write(
+                    f"AI 保險絲通過：本月估算已用 ${ai_decision['spent']:.4f}，"
+                    f"安全上限 ${ai_decision['stop_at']:.4f}"
+                )
+                openai_api_key = config.get("openai_api_key")
+            else:
+                st.write(f"AI 已停用：{ai_decision['reason']}，改用免費規則版報告")
+                openai_api_key = None
             report = build_report(
                 result,
-                openai_api_key=config.get("openai_api_key"),
+                openai_api_key=openai_api_key,
                 model=config.get("openai_model"),
+                input_price_per_1m=config.get("ai_input_price_per_1m"),
+                output_price_per_1m=config.get("ai_output_price_per_1m"),
             )
             st.write("報告產生完成")
 
@@ -144,6 +157,11 @@ def _load_config() -> dict[str, Any]:
         "supabase_ready": is_configured(supabase_url, supabase_anon_key),
         "openai_api_key": _secret("OPENAI_API_KEY"),
         "openai_model": _secret("OPENAI_MODEL") or "gpt-4.1-mini",
+        "ai_monthly_budget_usd": _secret_float("AI_MONTHLY_BUDGET_USD"),
+        "ai_stop_buffer_usd": _secret_float("AI_STOP_BUFFER_USD", default=0.05),
+        "ai_estimated_report_cost_usd": _secret_float("AI_ESTIMATED_REPORT_COST_USD", default=0.02),
+        "ai_input_price_per_1m": _secret_float("AI_INPUT_PRICE_PER_1M_USD", default=0.40),
+        "ai_output_price_per_1m": _secret_float("AI_OUTPUT_PRICE_PER_1M_USD", default=1.60),
     }
 
 
@@ -158,11 +176,104 @@ def _secret(name: str) -> str | None:
     return value or None
 
 
+def _secret_float(name: str, default: float | None = None) -> float | None:
+    value = _secret(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _show_storage_status(config: dict[str, Any]) -> None:
     if config["supabase_ready"]:
         st.success(f"Supabase 已設定，將只寫入 `{config['supabase_table']}`。")
     else:
         st.info("Supabase 尚未設定：可以先測報告，但不會存檔。")
+
+
+def _show_ai_guard_status(config: dict[str, Any]) -> None:
+    if not config.get("openai_api_key"):
+        st.info("AI 改寫未啟用：目前使用免費規則版報告。")
+        return
+    if config.get("ai_monthly_budget_usd") is None:
+        st.warning("偵測到 OpenAI API key，但沒有設定 AI_MONTHLY_BUDGET_USD，所以保險絲會阻止 AI 呼叫。")
+        return
+    decision = _ai_guard_decision(config)
+    if decision["allowed"]:
+        st.success(
+            f"AI 保險絲已啟用：本月估算 ${decision['spent']:.4f} / "
+            f"安全上限 ${decision['stop_at']:.4f}，接近上限會自動改用免費規則版。"
+        )
+    else:
+        st.warning(f"AI 保險絲已停用 OpenAI：{decision['reason']}")
+
+
+def _ai_guard_decision(config: dict[str, Any]) -> dict[str, Any]:
+    if not config.get("openai_api_key"):
+        return {"allowed": False, "reason": "沒有 OPENAI_API_KEY"}
+    budget = config.get("ai_monthly_budget_usd")
+    if budget is None or budget <= 0:
+        return {"allowed": False, "reason": "沒有設定 AI_MONTHLY_BUDGET_USD"}
+    if not config["supabase_ready"]:
+        return {"allowed": False, "reason": "Supabase 未設定，無法持久追蹤 AI 花費"}
+
+    spent = _current_month_ai_spend(config)
+    stop_buffer = max(float(config.get("ai_stop_buffer_usd") or 0), 0)
+    estimated_next = max(float(config.get("ai_estimated_report_cost_usd") or 0), 0)
+    stop_at = max(float(budget) - stop_buffer, 0)
+    remaining_to_stop = stop_at - spent
+    if remaining_to_stop < estimated_next:
+        return {
+            "allowed": False,
+            "reason": (
+                f"本月估算已用 ${spent:.4f}，安全上限 ${stop_at:.4f}，"
+                f"不足以保留下一次估算 ${estimated_next:.4f}"
+            ),
+            "spent": spent,
+            "stop_at": stop_at,
+        }
+    return {"allowed": True, "reason": "ok", "spent": spent, "stop_at": stop_at}
+
+
+def _current_month_ai_spend(config: dict[str, Any]) -> float:
+    try:
+        rows = fetch_reports(
+            supabase_url=config.get("supabase_url"),
+            supabase_key=config.get("supabase_anon_key"),
+            table_name=config["supabase_table"],
+            limit=500,
+        )
+    except Exception:
+        return 0.0
+    now = datetime.now(timezone.utc)
+    total = 0.0
+    for row in rows:
+        created_at = _parse_datetime(row.get("created_at"))
+        if not created_at or created_at.year != now.year or created_at.month != now.month:
+            continue
+        metrics_json = row.get("metrics_json") or {}
+        metrics = metrics_json.get("metrics") or metrics_json
+        usage = metrics.get("ai_usage") or {}
+        cost = usage.get("estimated_cost_usd")
+        try:
+            total += float(cost or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _require_password_if_configured() -> None:
